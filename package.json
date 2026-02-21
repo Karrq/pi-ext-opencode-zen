@@ -1,0 +1,36 @@
+{
+  "name": "pi-ext-opencode-zen",
+  "version": "1.0.0",
+  "description": "Pi extension for OpenCode Zen provider - Zen-authoritative model registry with models.dev enrichment",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@juanibiapina/pi-extension-settings": "*"
+  },
+  "peerDependenciesMeta": {
+    "@juanibiapina/pi-extension-settings": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "opencode",
+    "llm",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT"
+}
