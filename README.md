@@ -1,6 +1,8 @@
 # pi-ext-opencode-zen
 
-A Pi extension that registers the `opencode-zen` provider, providing access to OpenCode models through the zen.opencode.ai gateway. The extension uses **Zen's `/v1/models` API as the authoritative source** for available models, enriched with metadata from models.dev (capabilities, routing, pricing).
+Pi ships with a hardcoded OpenCode provider, but its model list only updates when pi itself is updated. This extension replaces it with a dynamic version that fetches available models directly from Zen's `/v1/models` API at startup, so new models are available immediately without waiting for a pi release.
+
+The extension enriches the live model list with metadata from models.dev (capabilities, routing, pricing).
 
 ## Features
 
