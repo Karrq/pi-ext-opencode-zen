@@ -222,47 +222,12 @@ function saveFreeModelIds(ids: string[]) {
 	}
 }
 
-async function getModels(hasApiKey: boolean): Promise<ModelConfig[]> {
-	// Step 1: Get authoritative model list from Zen
-	let zenModelIds: string[];
-	try {
-		zenModelIds = await fetchZenModels();
-		saveZenModelsToCache(zenModelIds);
-	} catch (error) {
-		console.warn("Failed to fetch Zen models, using cache:", error);
-		const cached = loadZenModelsFromCache();
-		if (!cached) {
-			throw new Error("No cached Zen models available and API fetch failed");
-		}
-		zenModelIds = cached;
-	}
-
-	// Step 2: Fetch models.dev for metadata enrichment
-	let modelsDevData: ModelsDevAPI["opencode"] | undefined;
-	try {
-		const response = await fetch(MODELS_API_URL);
-		if (response.ok) {
-			const data = (await response.json()) as ModelsDevAPI;
-			modelsDevData = data.opencode;
-		}
-	} catch (error) {
-		console.warn("Failed to fetch models.dev metadata:", error);
-		// Fall back to cached enriched models if available
-		const cachedModels = loadModelsFromCache();
-		if (cachedModels) {
-			console.warn("Using cached enriched models as fallback");
-			// Filter cached models to only those still in Zen's list
-			const zenSet = new Set(zenModelIds);
-			let models = cachedModels.filter((m) => zenSet.has(m.id));
-			if (!hasApiKey) {
-				models = models.filter((m) => m.cost.input === 0 && m.cost.output === 0);
-			}
-			return models;
-		}
-		console.warn("No cached models available, will use defaults");
-	}
-
-	// Step 3: Build model configs - only for models in Zen's list
+/** Build enriched ModelConfig[] from Zen model IDs + optional models.dev data. */
+function buildModels(
+	zenModelIds: string[],
+	modelsDevData: ModelsDevAPI["opencode"] | undefined,
+	hasApiKey: boolean,
+): ModelConfig[] {
 	let models: ModelConfig[] = [];
 	const providerDefaultNpm = modelsDevData?.provider?.npm;
 
@@ -275,7 +240,8 @@ async function getModels(hasApiKey: boolean): Promise<ModelConfig[]> {
 			const backend = getBackendFromNpmPackage(npmPackage, providerDefaultNpm);
 
 			const input: ("text" | "image")[] = ["text"];
-			if (devModel.attachment || devModel.modalities?.includes("image")) {
+			const modalities = devModel.modalities;
+			if (devModel.attachment || (Array.isArray(modalities) && modalities.includes("image"))) {
 				input.push("image");
 			}
 
@@ -317,12 +283,62 @@ async function getModels(hasApiKey: boolean): Promise<ModelConfig[]> {
 	// Save enriched models to cache
 	saveModelsToCache(models);
 
-	// Step 4: Filter to free models if no API key
+	// Filter to free models if no API key
 	if (!hasApiKey) {
 		models = models.filter((m) => m.cost.input === 0 && m.cost.output === 0);
 	}
 
 	return models;
+}
+
+/** Fetch with a timeout. Returns null on failure or timeout. */
+async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response | null> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const response = await fetch(url, { signal: controller.signal });
+		return response.ok ? response : null;
+	} catch {
+		return null;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** Fetch fresh models from Zen + models.dev. Returns null on failure. */
+async function fetchFreshModels(hasApiKey: boolean, timeoutMs?: number): Promise<ModelConfig[] | null> {
+	// Step 1: Get authoritative model list from Zen
+	let zenModelIds: string[];
+	try {
+		if (timeoutMs !== undefined) {
+			const response = await fetchWithTimeout(ZEN_MODELS_URL, timeoutMs);
+			if (!response) return null;
+			const data = (await response.json()) as ZenModelsResponse;
+			if (!data.data || !Array.isArray(data.data)) return null;
+			zenModelIds = data.data.map((m) => m.id);
+		} else {
+			zenModelIds = await fetchZenModels();
+		}
+		saveZenModelsToCache(zenModelIds);
+	} catch {
+		return null;
+	}
+
+	// Step 2: Fetch models.dev for metadata enrichment
+	let modelsDevData: ModelsDevAPI["opencode"] | undefined;
+	try {
+		const response = timeoutMs !== undefined
+			? await fetchWithTimeout(MODELS_API_URL, timeoutMs)
+			: await fetch(MODELS_API_URL);
+		if (response?.ok) {
+			const data = (await response.json()) as ModelsDevAPI;
+			modelsDevData = data.opencode;
+		}
+	} catch {
+		// Continue without enrichment - buildModels handles missing data
+	}
+
+	return buildModels(zenModelIds, modelsDevData, hasApiKey);
 }
 
 // =============================================================================
@@ -464,6 +480,30 @@ function showFreeModelChangeNotification(
 // Extension Entry Point
 // =============================================================================
 
+/** Register (or re-register) the opencode provider with the given models. */
+function registerModels(pi: ExtensionAPI, models: ModelConfig[]) {
+	MODEL_MAP.clear();
+	for (const model of models) {
+		MODEL_MAP.set(model.id, model);
+	}
+
+	pi.registerProvider("opencode", {
+		baseUrl: ZEN_BASE_URL,
+		apiKey: "OPENCODE_API_KEY",
+		api: "opencode-api" as Api,
+		models: models.map((m) => ({
+			id: m.id,
+			name: m.name,
+			reasoning: m.reasoning,
+			input: m.input,
+			cost: m.cost,
+			contextWindow: m.contextWindow,
+			maxTokens: m.maxTokens,
+		})),
+		streamSimple: streamOpenCodeZen,
+	});
+}
+
 export default async function (pi: ExtensionAPI) {
 	// Register extension settings
 	pi.events.emit("pi-extension-settings:register", {
@@ -479,50 +519,69 @@ export default async function (pi: ExtensionAPI) {
 
 	const apiKey = process.env.OPENCODE_API_KEY;
 	const hasApiKey = Boolean(apiKey);
-
-	// Fetch models
-	let models: ModelConfig[];
-	try {
-		models = await getModels(hasApiKey);
-	} catch (error) {
-		console.error("Failed to load OpenCode Zen models:", error);
-		return;
-	}
-
-	// Populate MODEL_MAP
-	MODEL_MAP.clear();
-	for (const model of models) {
-		MODEL_MAP.set(model.id, model);
-	}
-
-	// Track free model changes
-	const currentFreeIds = models.filter((m) => m.cost.input === 0 && m.cost.output === 0).map((m) => m.id);
 	const previousFreeIds = loadFreeModelIds();
-	saveFreeModelIds(currentFreeIds);
 
-	// Calculate free model changes
+	// -------------------------------------------------------------------------
+	// Cache-first loading: use cache immediately, refresh in background.
+	// On first run (no cache), do a blocking fetch with a short timeout.
+	// -------------------------------------------------------------------------
+
+	const cachedModels = loadModelsFromCache();
+
+	if (cachedModels && cachedModels.length > 0) {
+		// Fast path: register from cache instantly, then refresh in background
+		let models = hasApiKey
+			? cachedModels
+			: cachedModels.filter((m) => m.cost.input === 0 && m.cost.output === 0);
+
+		registerModels(pi, models);
+
+		// Background refresh - don't await, don't block pi startup
+		fetchFreshModels(hasApiKey).then((freshModels) => {
+			if (!freshModels || freshModels.length === 0) return;
+
+			// Re-register with fresh models
+			registerModels(pi, freshModels);
+
+			// Track and notify free model changes
+			const currentFreeIds = freshModels
+				.filter((m) => m.cost.input === 0 && m.cost.output === 0)
+				.map((m) => m.id);
+			saveFreeModelIds(currentFreeIds);
+		}).catch(() => {
+			// Silently keep using cache
+		});
+	} else {
+		// Cold start: no cache exists. Do a blocking fetch with a short timeout,
+		// so we don't stall pi startup for too long.
+		const COLD_START_TIMEOUT_MS = 3000;
+		const models = await fetchFreshModels(hasApiKey, COLD_START_TIMEOUT_MS);
+
+		if (!models || models.length === 0) {
+			console.error("OpenCode Zen: no cached models and fetch failed/timed out. Provider not registered.");
+			return;
+		}
+
+		registerModels(pi, models);
+
+		const currentFreeIds = models
+			.filter((m) => m.cost.input === 0 && m.cost.output === 0)
+			.map((m) => m.id);
+		saveFreeModelIds(currentFreeIds);
+	}
+
+	// -------------------------------------------------------------------------
+	// Free model change notifications (based on cache vs previous session)
+	// -------------------------------------------------------------------------
+
+	const currentFreeIds = [...MODEL_MAP.values()]
+		.filter((m) => m.cost.input === 0 && m.cost.output === 0)
+		.map((m) => m.id);
+
 	const added = currentFreeIds.filter((id) => !previousFreeIds.includes(id));
 	const removed = previousFreeIds.filter((id) => !currentFreeIds.includes(id));
 	const hasFreeModelChanges = added.length > 0 || removed.length > 0;
 
-	// Register provider
-	pi.registerProvider("opencode-zen", {
-		baseUrl: ZEN_BASE_URL,
-		apiKey: "OPENCODE_API_KEY",
-		api: "opencode-zen-api" as Api,
-		models: models.map((m) => ({
-			id: m.id,
-			name: m.name,
-			reasoning: m.reasoning,
-			input: m.input,
-			cost: m.cost,
-			contextWindow: m.contextWindow,
-			maxTokens: m.maxTokens,
-		})),
-		streamSimple: streamOpenCodeZen,
-	});
-
-	// Show free model change notification on first interaction (if applicable)
 	if (hasFreeModelChanges && getExtensionSetting("opencode-zen", "notify-free-model-changes", "on") === "on") {
 		let notificationShown = false;
 
@@ -533,7 +592,6 @@ export default async function (pi: ExtensionAPI) {
 			}
 		});
 
-		// Also show on session_start if interactive
 		pi.on("session_start", (event, ctx) => {
 			if (!notificationShown && ctx.hasUI) {
 				showFreeModelChangeNotification(ctx, added, removed);
@@ -545,7 +603,7 @@ export default async function (pi: ExtensionAPI) {
 	// Listen for model selection to detect if selected model disappears
 	pi.on("model_select", (event, ctx) => {
 		const modelId = event.model.id;
-		if (event.model.provider !== "opencode-zen") return;
+		if (event.model.provider !== "opencode") return;
 
 		if (!MODEL_MAP.has(modelId)) {
 			if (ctx.ui?.notify) {
