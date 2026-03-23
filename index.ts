@@ -5,6 +5,11 @@
  * Uses Zen's /v1/models endpoint as the authoritative source for available models,
  * enriched with metadata from models.dev (capabilities, routing, pricing).
  *
+ * Free Model Behavior:
+ *   - When OPENCODE_API_KEY is not set, defaults to DEFAULT_OPENCODE_API_KEY API key
+ *   - Zero-cost models (input cost 0 and output cost 0) are available without a paid key
+ *   - Logs auto-selected free model information
+ *
  * Usage:
  *   pi -e pi-ext-opencode-zen
  *   # Set OPENCODE_API_KEY=sk-... for full model access
@@ -32,6 +37,7 @@ import * as path from "node:path";
 // Constants
 // =============================================================================
 
+const DEFAULT_OPENCODE_API_KEY = "public";
 const ZEN_BASE_URL = "https://opencode.ai/zen/v1";
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/models`;
 const MODELS_API_URL = "https://models.dev/api.json";
@@ -378,8 +384,8 @@ export function streamOpenCodeZen(
 
 			// Check if API key is required for this model
 			const isFreeModel = cfg.cost.input === 0 && cfg.cost.output === 0;
-			if (!apiKey && !isFreeModel) {
-				throw new Error(`No OpenCode API key. Set OPENCODE_API_KEY env var. (This model requires an API key.)`);
+			if (apiKey === DEFAULT_OPENCODE_API_KEY && !isFreeModel) {
+				  throw new Error(`No valid OpenCode API key. Set OPENCODE_API_KEY env var. (This model requires an API key other than ${DEFAULT_OPENCODE_API_KEY}.)`);
 			}
 
 			const modelWithBaseUrl = { ...model, baseUrl: ZEN_BASE_URL };
@@ -487,9 +493,12 @@ function registerModels(pi: ExtensionAPI, models: ModelConfig[]) {
 		MODEL_MAP.set(model.id, model);
 	}
 
+  // Use DEFAULT_OPENCODE_API_KEY as default API key for free models
+	const apiKey = process.env.OPENCODE_API_KEY || DEFAULT_OPENCODE_API_KEY;
+
 	pi.registerProvider("opencode", {
 		baseUrl: ZEN_BASE_URL,
-		apiKey: "OPENCODE_API_KEY",
+		apiKey: apiKey,
 		api: "opencode-api" as Api,
 		models: models.map((m) => ({
 			id: m.id,
@@ -517,8 +526,8 @@ export default async function (pi: ExtensionAPI) {
 		}]
 	});
 
-	const apiKey = process.env.OPENCODE_API_KEY;
-	const hasApiKey = Boolean(apiKey);
+	// Use DEFAULT_OPENCODE_API_KEY as default API key for free models
+	const hasApiKey = !!process.env.OPENCODE_API_KEY && process.env.OPENCODE_API_KEY !== DEFAULT_OPENCODE_API_KEY;
 	const previousFreeIds = loadFreeModelIds();
 
 	// -------------------------------------------------------------------------
